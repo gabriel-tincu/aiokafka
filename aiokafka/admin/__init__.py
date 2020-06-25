@@ -2,13 +2,22 @@ import logging
 import asyncio
 from aiokafka import __version__
 from aiokafka.client import AIOKafkaClient
-from kafka.errors import IncompatibleBrokerVersion
+from collections import defaultdict
+from kafka.errors import IncompatibleBrokerVersion, for_code
 from kafka.protocol.metadata import MetadataRequest
+from kafka.protocol.commit import OffsetFetchRequest, GroupCoordinatorRequest
 from kafka.protocol.admin import (
+    CreatePartitionsRequest,
     CreateTopicsRequest,
     DeleteTopicsRequest,
+    DescribeGroupsRequest,
+    DescribeConfigsRequest,
+    AlterConfigsRequest,
+    ListGroupsRequest,
     ApiVersionRequest_v0)
+from kafka.structs import TopicPartition, OffsetAndMetadata
 from kafka.admin import KafkaAdminClient
+from kafka.admin.config_resource import ConfigResourceType
 log = logging.getLogger(__name__)
 
 
@@ -86,10 +95,10 @@ class AIOKafkaAdminClient(object):
         self._closed = True
         log.debug("AIOKafkaAdminClient is now closed.")
 
-    async def _send_request(self, request):
-        return await self._client.send(
-            self._client.get_random_node(),
-            request)
+    async def _send_request(self, request, node_id=None):
+        if node_id is None:
+            node_id = self._client.get_random_node()
+        return await self._client.send(node_id, request)
 
     async def _get_version_info(self):
         resp = await self._send_request(ApiVersionRequest_v0())
@@ -216,43 +225,6 @@ class AIOKafkaAdminClient(object):
         obj.pop('topics')  # We have 'describe_topics' for this
         return obj
 
-    async def describe_acls(self, acl_filter):
-        """Describe a set of ACLs
-
-        Used to return a set of ACLs matching the supplied ACLFilter.
-        The cluster must be configured with an authorizer for this to work, or
-        you will get a SecurityDisabledError
-
-        :param acl_filter: an ACLFilter object
-        :return: tuple of a list of matching ACL objects and a KafkaError
-        (NoError if successful)
-        """
-        pass
-
-    def create_acls(self, acls):
-        """Create a list of ACLs
-
-        This endpoint only accepts a list of concrete ACL objects,
-        no ACLFilters. Throws TopicAlreadyExistsError if topic is
-        already present.
-
-        :param acls: a list of ACL objects
-        :return: dict of successes and failures
-        """
-        pass
-
-    def delete_acls(self, acl_filters):
-        """Delete a set of ACLs
-
-        Deletes all ACLs matching the list of input ACLFilter
-
-        :param acl_filters: a list of ACLFilter
-        :return: a list of 3-tuples corresponding to the list of input filters.
-                 The tuples hold (the input ACLFilter, list of affected ACLs,
-                 KafkaError instance)
-        """
-        pass
-
     def describe_configs(self, config_resources, include_synonyms=False):
         """Fetch configuration parameters for one or more Kafka resources.
 
@@ -264,23 +236,63 @@ class AIOKafkaAdminClient(object):
             supported by all versions. Default: False.
         :return: Appropriate version of DescribeConfigsResponse class.
         """
-        pass
+
+        futures = []
+        version = self._matching_api_version(DescribeConfigsRequest)
+        if version == 0 and include_synonyms:
+            raise IncompatibleBrokerVersion(
+                "include_synonyms requires DescribeConfigsRequest >= v1,"
+                " which is not supported by Kafka {}.".format(self.api_version))
+        if version >= 2:
+            raise NotImplementedError(
+                "Support for DescribeConfigs v{} has not yet been added "
+                "to AIOKafkaAdminClient.".format(version))
+        broker_resources, topic_resources = self._convert_config_resources(config_resources)
+        req_cls = DescribeConfigsRequest[version]
+        for broker_id in broker_resources:
+            if version == 0:
+                req = req_cls(resources=broker_resources[broker_id])
+            else:
+                req = req_cls(resources=broker_resources[broker_id], include_synonyms=include_synonyms)
+            futures.append(self._send_request(req, broker_id))
+        if version == 0:
+            req = req_cls(topic_resources)
+        else:
+            req = req_cls(topic_resources, include_synonyms)
+        futures.append(self._send_request(req))
+        return asyncio.gather(*futures)
 
     def alter_configs(self, config_resources):
         """Alter configuration parameters of one or more Kafka resources.
-
-        Warning:
-            This is currently broken for BROKER resources because those must be
-            sent to that specific broker, versus this always picks the
-            least-loaded node. See the comment in the source code for details.
-            We would happily accept a PR fixing this.
-
         :param config_resources: A list of ConfigResource objects.
         :return: Appropriate version of AlterConfigsResponse class.
         """
-        pass
+        futures = []
+        version = self._matching_api_version(AlterConfigsRequest)
+        if version > 2:
+            raise NotImplementedError(
+                "Support for AlterConfigs v{} has not yet been added "
+                "to AIOKafkaAdminClient.".format(version))
+        broker_resources, topic_resources = self._convert_config_resources(config_resources)
+        req_cls = AlterConfigsRequest[version]
+        futures.append(self._send_request(req_cls(resources=topic_resources)))
+        for broker_id in broker_resources:
+            futures.append(self._send_request(req_cls(resources=broker_resources[broker_id]), broker_id))
+        return asyncio.gather(*futures)
 
-    def create_partitions(
+    @staticmethod
+    def _convert_config_resources(config_resources):
+        broker_resources = defaultdict(list)
+        topic_resources = []
+        for config_resource in config_resources:
+            resource = KafkaAdminClient._convert_describe_config_resource_request(config_resource)
+            if config_resource.resource_type == ConfigResourceType.BROKER:
+                broker_resources[int(resource[1])].append(resource)
+            else:
+                topic_resources.append(resource)
+        return broker_resources, topic_resources
+
+    async def create_partitions(
             self,
             topic_partitions,
             timeout_ms=None,
@@ -295,9 +307,16 @@ class AIOKafkaAdminClient(object):
             Default: False
         :return: Appropriate version of CreatePartitionsResponse class.
         """
-        pass
+        return await self._send_request(CreatePartitionsRequest[0](
+                topic_partitions=[
+                    (topic_name, (new_partitions.total_count, new_partitions.total_count))
+                    for topic_name, new_partitions in topic_partitions.items()
+                ],
+                timeout=timeout_ms,
+                validate_only=validate_only
+            ))
 
-    def describe_consumer_groups(
+    async def describe_consumer_groups(
             self,
             group_ids,
             group_coordinator_id=None,
@@ -322,9 +341,33 @@ class AIOKafkaAdminClient(object):
             plan to change this to return namedtuples as well as decoding the
             partition assignments.
         """
-        pass
+        version = self._matching_api_version(DescribeGroupsRequest)
+        if version < 3 and include_authorized_operations:
+            raise IncompatibleBrokerVersion(
+                "include_authorized_operations requests "
+                "DescribeGroupsRequest >= v3, which is not "
+                "supported by Kafka {}".format(version)
+            )
+        req_class = DescribeGroupsRequest[version]
+        futures = []
+        node_to_groups = defaultdict(set)
+        for group_id in group_ids:
+            if group_coordinator_id is None:
+                node_id = await self.get_group_coordinator(group_id)
+            else:
+                node_id = group_coordinator_id
+            node_to_groups[node_id].add(group_id)
+        for node_id, groups in node_to_groups.items():
+            if include_authorized_operations:
+                req = req_class(list(groups), include_authorized_operations)
+            else:
+                req = req_class(list(groups))
+            future = self._send_request(req, node_id)
+            futures.append(future)
+        results = await asyncio.gather(*futures)
+        return results
 
-    def list_consumer_groups(self, broker_ids=None):
+    async def list_consumer_groups(self, broker_ids=None):
         """List all consumer groups known to the cluster.
 
         This returns a list of Consumer Group tuples. The tuples are
@@ -349,10 +392,41 @@ class AIOKafkaAdminClient(object):
         :exception GroupLoadInProgressError: The coordinator is loading and
             hence can't process requests.
         """
-        pass
+        if broker_ids is None:
+            metadata = await self._get_cluster_metadata()
+            broker_ids = [broker.node_id for broker in metadata.brokers]
+        consumer_groups = set()
+        for broker_id in broker_ids:
+            response = await self._send_request(
+                ListGroupsRequest[self._matching_api_version(ListGroupsRequest)](),
+                broker_id
+            )
+            if response.API_VERSION > 2:
+                raise NotImplementedError(
+                    "Support for ListGroupsResponse_v{} has not "
+                    "yet been added to KafkaAdminClient.".format(response.API_VERSION))
+            consumer_groups.update(response.groups)
+        return consumer_groups
 
-    def list_consumer_group_offsets(self, group_id, group_coordinator_id=None,
-                                    partitions=None):
+    async def get_group_coordinator(self, group_id):
+        """Find the broker id for a given consumer group
+
+        :param group_id the consumer group id
+        :return int: the acting coordinator broker id
+        """
+        version = self._matching_api_version(GroupCoordinatorRequest)
+        request = GroupCoordinatorRequest[version](group_id)
+        response = await self._send_request(request)
+        if response.error_code:
+            raise for_code(response.error_code)(f"Unable to get coordinator id for {group_id}")
+        return response.coordinator_id
+
+    async def list_consumer_group_offsets(
+            self,
+            group_id,
+            group_coordinator_id=None,
+            partitions=None
+    ):
         """Fetch Consumer Offsets for a single consumer group.
 
         Note:
@@ -377,4 +451,28 @@ class AIOKafkaAdminClient(object):
             TopicPartition. A `-1` can only happen for partitions that are
             explicitly specified.
         """
-        pass
+        version = self._matching_api_version(OffsetFetchRequest)
+        if version > 3:
+            raise NotImplementedError(f"OffsetFetchRequest version {version} not supported")
+        if version <= 1 and partitions is None:
+            ValueError(
+                """OffsetFetchRequest_v{} requires specifying the
+                partitions for which to fetch offsets. Omitting the
+                partitions is only supported on brokers >= 0.10.2.
+                For details, see KIP-88.""".format(version))
+        if partitions:
+            topics_partitions_dict = defaultdict(set)
+            for topic, partition in partitions:
+                topics_partitions_dict[topic].add(partition)
+            partitions = [(topic, list(partitions)) for topic, partitions in topics_partitions_dict.items()]
+        request = OffsetFetchRequest[version](group_id, partitions)
+        if group_coordinator_id is None:
+            group_coordinator_id = await self.get_group_coordinator(group_id)
+        response = await self._send_request(request, group_coordinator_id)
+        response_dict = {}
+        for topic, partitions in response.topics:
+            for partition, offset, metadata, error_code in partitions:
+                if error_code:
+                    raise for_code(response.error_code)(f"Unable to get offset info for {topic} and {partition}")
+                response_dict[TopicPartition(topic, partition)] = OffsetAndMetadata(offset, metadata)
+        return response_dict
