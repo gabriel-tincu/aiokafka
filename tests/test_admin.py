@@ -2,6 +2,7 @@ from aiokafka.admin import AIOKafkaAdminClient
 from ._testutil import KafkaIntegrationTestCase, run_until_complete
 
 from kafka.admin import NewTopic
+from kafka.admin.config_resource import ConfigResource, ConfigResourceType
 import random
 
 
@@ -60,6 +61,14 @@ class TestAdmin(KafkaIntegrationTestCase):
         assert error_code == 0
         topics = await self.admin.list_topics()
         assert name not in topics
+
+    @run_until_complete
+    async def test_describe_configs(self):
+        tn = self.topic_name
+        await self.admin.create_topics([NewTopic(tn, 1, 1)])
+        cr = ConfigResource(ConfigResourceType.TOPIC, tn, None)
+        resp = await self.admin.describe_configs(cr)
+        assert False, f"{resp}"
 
     @property
     def topic_name(self):

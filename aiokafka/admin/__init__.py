@@ -16,13 +16,15 @@ from kafka.protocol.admin import (
     ListGroupsRequest,
     ApiVersionRequest_v0)
 from kafka.structs import TopicPartition, OffsetAndMetadata
-from kafka.admin import KafkaAdminClient
+from kafka.admin import KafkaAdminClient as Admin
 from kafka.admin.config_resource import ConfigResourceType
 log = logging.getLogger(__name__)
 
 
 class AIOKafkaAdminClient(object):
     """A class for administering the Kafka cluster.
+
+    !!! Very very very much new territory with exciting new bugs to be found !!!
 
     Keyword Arguments:
         bootstrap_servers: 'host[:port]' string (or list of 'host[:port]'
@@ -133,8 +135,6 @@ class AIOKafkaAdminClient(object):
         min_version, max_version = self._version_info[api_key]
         version = min(len(operation) - 1, max_version)
         if version < min_version:
-            # max library version is less than min broker version. Currently,
-            # no Kafka versions specify a min msg version. Maybe in the future?
             raise IncompatibleBrokerVersion(
                 "No version of the '{}' Kafka protocol is supported by "
                 "both the client and broker."
@@ -157,8 +157,7 @@ class AIOKafkaAdminClient(object):
         :return: Appropriate version of CreateTopicResponse class.
         """
         version = self._matching_api_version(CreateTopicsRequest)
-        topics = [KafkaAdminClient._convert_new_topic_request(new_topic)
-                  for new_topic in new_topics]
+        topics = [Admin._convert_new_topic_request(nt) for nt in new_topics]
         timeout_ms = timeout_ms or self.request_timeout_ms
         if version == 0:
             if validate_only:
@@ -179,7 +178,7 @@ class AIOKafkaAdminClient(object):
         else:
             raise NotImplementedError(
                 "Support for CreateTopics v{} has not yet been added "
-                "to KafkaAdminClient."
+                "to AIOKafkaAdminClient."
                 .format(version))
         response = await self._client.send(
             self._client.get_random_node(),
@@ -194,9 +193,9 @@ class AIOKafkaAdminClient(object):
             before the broker returns.
         :return: Appropriate version of DeleteTopicsResponse class.
         """
-        request = DeleteTopicsRequest[
-            self._matching_api_version(DeleteTopicsRequest)
-        ](topics, timeout_ms or self.request_timeout_ms)
+        version = self._matching_api_version(DeleteTopicsRequest)
+        req_cls = DeleteTopicsRequest[version]
+        request = req_cls(topics, timeout_ms or self.request_timeout_ms)
         response = await self._send_request(request)
         return response
 
@@ -243,22 +242,20 @@ class AIOKafkaAdminClient(object):
             raise IncompatibleBrokerVersion(
                 "include_synonyms requires DescribeConfigsRequest >= v1,"
                 " which is not supported by Kafka {}.".format(self.api_version))
-        if version >= 2:
-            raise NotImplementedError(
-                "Support for DescribeConfigs v{} has not yet been added "
-                "to AIOKafkaAdminClient.".format(version))
-        broker_resources, topic_resources = self._convert_config_resources(config_resources)
+        broker_res, topic_res = self._convert_config_resources(config_resources)
         req_cls = DescribeConfigsRequest[version]
-        for broker_id in broker_resources:
+        for broker_id in broker_res:
             if version == 0:
-                req = req_cls(resources=broker_resources[broker_id])
+                req = req_cls(resources=broker_res[broker_id])
             else:
-                req = req_cls(resources=broker_resources[broker_id], include_synonyms=include_synonyms)
+                req = req_cls(
+                    resources=broker_res[broker_id],
+                    include_synonyms=include_synonyms)
             futures.append(self._send_request(req, broker_id))
         if version == 0:
-            req = req_cls(topic_resources)
+            req = req_cls(topic_res)
         else:
-            req = req_cls(topic_resources, include_synonyms)
+            req = req_cls(topic_res, include_synonyms)
         futures.append(self._send_request(req))
         return asyncio.gather(*futures)
 
@@ -269,15 +266,14 @@ class AIOKafkaAdminClient(object):
         """
         futures = []
         version = self._matching_api_version(AlterConfigsRequest)
-        if version > 2:
-            raise NotImplementedError(
-                "Support for AlterConfigs v{} has not yet been added "
-                "to AIOKafkaAdminClient.".format(version))
-        broker_resources, topic_resources = self._convert_config_resources(config_resources)
+        broker_resources, topic_resources = self._convert_config_resources(
+            config_resources
+        )
         req_cls = AlterConfigsRequest[version]
         futures.append(self._send_request(req_cls(resources=topic_resources)))
         for broker_id in broker_resources:
-            futures.append(self._send_request(req_cls(resources=broker_resources[broker_id]), broker_id))
+            req = req_cls(resources=broker_resources[broker_id])
+            futures.append(self._send_request(req, broker_id))
         return asyncio.gather(*futures)
 
     @staticmethod
@@ -285,7 +281,7 @@ class AIOKafkaAdminClient(object):
         broker_resources = defaultdict(list)
         topic_resources = []
         for config_resource in config_resources:
-            resource = KafkaAdminClient._convert_describe_config_resource_request(config_resource)
+            resource = Admin._convert_describe_config_resource_request(config_resource)
             if config_resource.resource_type == ConfigResourceType.BROKER:
                 broker_resources[int(resource[1])].append(resource)
             else:
@@ -308,13 +304,13 @@ class AIOKafkaAdminClient(object):
         :return: Appropriate version of CreatePartitionsResponse class.
         """
         return await self._send_request(CreatePartitionsRequest[0](
-                topic_partitions=[
-                    (topic_name, (new_partitions.total_count, new_partitions.total_count))
-                    for topic_name, new_partitions in topic_partitions.items()
-                ],
-                timeout=timeout_ms,
-                validate_only=validate_only
-            ))
+            topic_partitions=[
+                (topic_name, (new_partitions.total_count, new_partitions.total_count))
+                for topic_name, new_partitions in topic_partitions.items()
+            ],
+            timeout=timeout_ms,
+            validate_only=validate_only
+        ))
 
     async def describe_consumer_groups(
             self,
@@ -418,7 +414,8 @@ class AIOKafkaAdminClient(object):
         request = GroupCoordinatorRequest[version](group_id)
         response = await self._send_request(request)
         if response.error_code:
-            raise for_code(response.error_code)(f"Unable to get coordinator id for {group_id}")
+            err = for_code(response.error_code)
+            raise err(f"Unable to get coordinator id for {group_id}")
         return response.coordinator_id
 
     async def list_consumer_group_offsets(
@@ -452,19 +449,17 @@ class AIOKafkaAdminClient(object):
             explicitly specified.
         """
         version = self._matching_api_version(OffsetFetchRequest)
-        if version > 3:
-            raise NotImplementedError(f"OffsetFetchRequest version {version} not supported")
         if version <= 1 and partitions is None:
             ValueError(
-                """OffsetFetchRequest_v{} requires specifying the
+               f"""OffsetFetchRequest_v{version} requires specifying the
                 partitions for which to fetch offsets. Omitting the
-                partitions is only supported on brokers >= 0.10.2.
-                For details, see KIP-88.""".format(version))
+                partitions is only supported on brokers >= 0.10.2""")
         if partitions:
             topics_partitions_dict = defaultdict(set)
             for topic, partition in partitions:
                 topics_partitions_dict[topic].add(partition)
-            partitions = [(topic, list(partitions)) for topic, partitions in topics_partitions_dict.items()]
+            partitions = [(topic, list(partitions)) for
+                          topic, partitions in topics_partitions_dict.items()]
         request = OffsetFetchRequest[version](group_id, partitions)
         if group_coordinator_id is None:
             group_coordinator_id = await self.get_group_coordinator(group_id)
@@ -473,6 +468,9 @@ class AIOKafkaAdminClient(object):
         for topic, partitions in response.topics:
             for partition, offset, metadata, error_code in partitions:
                 if error_code:
-                    raise for_code(response.error_code)(f"Unable to get offset info for {topic} and {partition}")
-                response_dict[TopicPartition(topic, partition)] = OffsetAndMetadata(offset, metadata)
+                    err = for_code(response.error_code)
+                    raise err(f"Unable to get offset info for {topic} and {partition}")
+                tp = TopicPartition(topic, partition)
+                offset_plus_meta = OffsetAndMetadata(offset, metadata)
+                response_dict[tp] = offset_plus_meta
         return response_dict
